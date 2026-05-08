@@ -2,8 +2,8 @@ name: iGPSport to Garmin Sync
 
 on:
   schedule:
-    - cron: '0 */6 * * *'  # 每6小时运行一次
-  workflow_dispatch:        # 允许手动触发
+    - cron: '0 */6 * * *'
+  workflow_dispatch:
 
 jobs:
   sync:
@@ -26,16 +26,27 @@ jobs:
           restore-keys: |
             ${{ runner.os }}-pip-
 
-      # 缓存 Garmin Token，避免每次运行都重新登录
       - name: Cache Garmin tokens
         uses: actions/cache@v4
         with:
-          # python-garminconnect 0.3.0+ 默认将 token 存在 ~/.garminconnect/
-          # 为了在 Job 间持久化，我们缓存整个目录
           path: ~/.garminconnect
           key: ${{ runner.os }}-garmin-token
           restore-keys: |
             ${{ runner.os }}-garmin-token-
+
+      # 修复 mobile.integration.garmin.com DNS 解析问题
+      - name: Fix Garmin mobile domain DNS
+        run: |
+          # 获取 mobile.integration.garmin.com 的 IP 地址
+          IP=$(dig +short mobile.integration.garmin.com | head -1)
+          if [ -n "$IP" ]; then
+            echo "Resolved mobile.integration.garmin.com to $IP"
+            echo "$IP mobile.integration.garmin.com" | sudo tee -a /etc/hosts
+          else
+            # 备用 IP（从公共记录获取，可能变化但大概率可用）
+            echo "Using fallback IP for mobile.integration.garmin.com"
+            echo "3.214.47.22 mobile.integration.garmin.com" | sudo tee -a /etc/hosts
+          fi
           
       - name: Install dependencies
         run: |
@@ -49,7 +60,6 @@ jobs:
           IGPSPORT_REGION: ${{ secrets.IGPSPORT_REGION || 'cn' }}
           GARMIN_EMAIL: ${{ secrets.GARMIN_EMAIL }}
           GARMIN_PASSWORD: ${{ secrets.GARMIN_PASSWORD }}
-          # 可根据你的账号区域选择 'cn' 或 'com'
           GARMIN_DOMAIN: ${{ secrets.GARMIN_DOMAIN || 'com' }}
         run: python sync_igpsport_to_garmin.py
         
@@ -60,7 +70,6 @@ jobs:
           if [ -f last_sync_date.json ]; then
             git add last_sync_date.json
           fi
-          # 使用新库后，不再需要手动添加 token 文件到仓库
           git diff --quiet && git diff --staged --quiet || git commit -m "Update last sync date [skip ci]"
           
       - name: Push changes
