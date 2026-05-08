@@ -38,6 +38,7 @@ jobs:
         run: |
           python -m pip install --upgrade pip
           pip install -r requirements.txt
+          pip install git+https://github.com/cyberjunky/python-garminconnect.git@v0.3.4
           
       - name: Run sync script
         env:
