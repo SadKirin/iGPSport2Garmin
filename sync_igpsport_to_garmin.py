@@ -27,7 +27,7 @@ logger = logging.getLogger("igpsport-to-garmin")
 
 # Constants
 LAST_SYNC_FILE = "last_sync_date.json"
-OVERLAP_BUFFER_MINUTES = 5  # Consider activities overlapping if within 5 minutes
+OVERLAP_BUFFER_MINUTES = 5
 
 
 class IGPSportClient:
@@ -72,19 +72,12 @@ class IGPSportClient:
         )
 
     def login(self) -> bool:
-        """Login to iGPSport."""
         url = f"{self.base_url}/auth/account/login"
-        data = {
-            "username": self.username,
-            "password": self.password,
-            "appId": "igpsport-web",
-        }
-
+        data = {"username": self.username, "password": self.password, "appId": "igpsport-web"}
         try:
             response = self.session.post(url, json=data)
             response.raise_for_status()
             result = response.json()
-
             if result["code"] == 0 and "data" in result:
                 access_token = result["data"]["access_token"]
                 self.token = access_token
@@ -99,56 +92,43 @@ class IGPSportClient:
             return False
 
     def get_activities(self, page_no: int = 1, page_size: int = 20) -> Dict:
-        """Get list of activities."""
         if not self.token:
             logger.error("Not logged in. Call login() first.")
             return {}
-
         url = f"{self.base_url}/web-gateway/web-analyze/activity/queryMyActivity"
         params = {"pageNo": page_no, "pageSize": page_size, "reqType": 0, "sort": 1}
-
         try:
             response = self.session.get(url, params=params)
             response.raise_for_status()
             result = response.json()
-
             if result["code"] == 0 and "data" in result:
                 return result["data"]
             else:
-                logger.error(
-                    f"Failed to get activities: {result.get('message', 'Unknown error')}"
-                )
+                logger.error(f"Failed to get activities: {result.get('message', 'Unknown error')}")
                 return {}
         except Exception as e:
             logger.error(f"Error getting activities: {e}")
             return {}
 
     def get_activity_detail(self, ride_id: int) -> Dict:
-        """Get details for a specific activity."""
         if not self.token:
             logger.error("Not logged in. Call login() first.")
             return {}
-
         url = f"{self.base_url}/web-gateway/web-analyze/activity/queryActivityDetail/{ride_id}"
-
         try:
             response = self.session.get(url)
             response.raise_for_status()
             result = response.json()
-
             if result["code"] == 0 and "data" in result:
                 return result["data"]
             else:
-                logger.error(
-                    f"Failed to get activity detail: {result.get('message', 'Unknown error')}"
-                )
+                logger.error(f"Failed to get activity detail: {result.get('message', 'Unknown error')}")
                 return {}
         except Exception as e:
             logger.error(f"Error getting activity detail: {e}")
             return {}
 
     def download_fit_file(self, fit_url: str) -> Optional[bytes]:
-        """Download a FIT file from the given URL."""
         try:
             response = requests_get(fit_url)
             response.raise_for_status()
@@ -159,19 +139,7 @@ class IGPSportClient:
 
 
 class GarminClient:
-    """
-    Client for Garmin Connect API using the python-garminconnect library (>=0.3.1)
-    with forced web service endpoint to avoid mobile domain resolution issues.
-    """
-
-    def __init__(
-        self,
-        email: str,
-        password: str,
-        domain: str,
-        max_retries: int = 3,
-        retry_delay: int = 5,
-    ):
+    def __init__(self, email: str, password: str, domain: str, max_retries: int = 3, retry_delay: int = 5):
         self.email = email
         self.password = password
         self.domain = domain  # 'cn' or 'com'
@@ -181,36 +149,16 @@ class GarminClient:
         self.authenticated = False
 
     def authenticate(self, force: bool = False) -> bool:
-        """
-        Authenticate with Garmin Connect.
-
-        Args:
-            force: If True, force a new authentication even if a token exists
-
-        Returns:
-            True if authentication is successful, False otherwise
-        """
         try:
             is_cn = (self.domain == 'cn')
-            logger.info(f"Logging in to Garmin {'CN' if is_cn else 'global'} region (web service mode)...")
-            
-            # Force use_webservice=True to avoid mobile.integration.garmin.com resolution failure
-            self.client = Garmin(
-                email=self.email,
-                password=self.password,
-                is_cn=is_cn,
-                use_webservice=True,  # 关键: 使用网页API而不是移动端API
-            )
-            
-            # login() will handle token refresh automatically
+            logger.info(f"Logging in to Garmin {'CN' if is_cn else 'global'} region...")
+            # 不使用 use_webservice 参数（0.3.2 支持但也可省略）
+            self.client = Garmin(email=self.email, password=self.password, is_cn=is_cn)
             self.client.login()
-            
-            # Verify authentication
-            self.client.get_full_name()
+            self.client.get_full_name()  # 验证
             logger.info("Successfully authenticated with Garmin Connect")
             self.authenticated = True
             return True
-
         except Exception as e:
             logger.error(f"Error authenticating with Garmin Connect: {e}")
             self.authenticated = False
@@ -218,37 +166,20 @@ class GarminClient:
             return False
 
     def get_activities(self, start_date: Optional[datetime.datetime] = None, limit: int = 10) -> List[Dict]:
-        """Get recent activities from Garmin Connect."""
         if not self.authenticated and not self.authenticate():
             logger.error("Cannot get activities: Not authenticated with Garmin")
             return []
-
         try:
             activities = self.client.get_activities(start=0, limit=limit)
-            if isinstance(activities, list):
-                return activities
-            else:
-                logger.warning(f"Unexpected type for activities: {type(activities)}")
-                return []
+            return activities if isinstance(activities, list) else []
         except Exception as e:
-            logger.error(f"Error getting activities from Garmin Connect: {e}")
-            # Try re-authentication
+            logger.error(f"Error getting activities: {e}")
             self.authenticated = False
             if self.authenticate(force=True):
                 return self.get_activities(start_date, limit)
             return []
 
     def upload_fit(self, fit_data: bytes, activity_name: str = None) -> Optional[Dict]:
-        """
-        Upload a FIT file to Garmin Connect with retry mechanism.
-
-        Args:
-            fit_data: The binary FIT file data
-            activity_name: Optional name for the activity
-
-        Returns:
-            Dict with upload response or None if all attempts failed
-        """
         if not self.authenticated and not self.authenticate():
             logger.error("Cannot upload activity: Not authenticated with Garmin")
             return None
@@ -261,9 +192,7 @@ class GarminClient:
             try:
                 if retries > 0:
                     delay = (self.retry_delay * (2 ** (retries - 1))) + random.uniform(0, 2)
-                    logger.info(
-                        f"Retrying upload (attempt {retries}/{self.max_retries}) after {delay:.2f}s delay..."
-                    )
+                    logger.info(f"Retrying upload in {delay:.2f}s...")
                     time.sleep(delay)
 
                 with tempfile.NamedTemporaryFile(suffix=".fit", delete=False) as tmp_file:
@@ -271,75 +200,49 @@ class GarminClient:
                     tmp_path = tmp_file.name
 
                 upload_response = self.client.upload_activity(tmp_path)
-                
-                # Optionally set activity name if library supports it
-                if activity_name and upload_response and "activityId" in upload_response:
-                    try:
-                        self.client.set_activity_description(upload_response["activityId"], activity_name)
-                        logger.info(f"Renamed activity to '{activity_name}'")
-                    except Exception as e:
-                        logger.warning(f"Failed to rename activity: {e}")
-
                 if tmp_path and os.path.exists(tmp_path):
                     os.unlink(tmp_path)
-                    
-                logger.info(f"Successfully uploaded activity to Garmin Connect")
+
+                logger.info("Successfully uploaded activity to Garmin Connect")
                 return upload_response
 
             except Exception as e:
                 last_error = e
                 retries += 1
-                logger.warning(
-                    f"Upload attempt {retries} failed: {activity_name or 'Unknown Activity'}, {len(fit_data)} bytes, {e}"
-                )
-
+                logger.warning(f"Upload attempt {retries} failed: {e}")
                 error_str = str(e).lower()
                 if "auth" in error_str or "login" in error_str or "token" in error_str:
-                    logger.info("Authentication issue detected. Re-authenticating...")
+                    logger.info("Re-authenticating...")
                     self.authenticated = False
                     self.authenticate(force=True)
-
                 if "429" in error_str or "rate" in error_str:
-                    extra_delay = 30 + random.uniform(0, 10)
-                    logger.warning(f"Rate limiting detected. Adding {extra_delay:.2f}s delay...")
-                    time.sleep(extra_delay)
-
+                    time.sleep(30 + random.uniform(0, 10))
                 if "409" in error_str or "conflict" in error_str:
-                    logger.warning("409 Conflict detected. Skipping activity.")
+                    logger.warning("Conflict detected, skipping.")
                     if tmp_path and os.path.exists(tmp_path):
                         os.unlink(tmp_path)
                     return None
-
                 if tmp_path and os.path.exists(tmp_path):
-                    try:
-                        os.unlink(tmp_path)
-                    except Exception:
-                        pass
+                    os.unlink(tmp_path)
                     tmp_path = None
 
         if tmp_path and os.path.exists(tmp_path):
             os.unlink(tmp_path)
-
-        logger.error(f"Failed to upload after {self.max_retries} attempts. Last error: {last_error}")
+        logger.error(f"Failed after {self.max_retries} attempts: {last_error}")
         return None
 
 
 def load_last_sync_date() -> datetime.datetime:
-    """Load the last sync date from the JSON file."""
     try:
         if os.path.exists(LAST_SYNC_FILE):
             with open(LAST_SYNC_FILE, "r") as f:
-                data = json.load(f)
-                return datetime.datetime.fromisoformat(data["last_sync_date"])
-        else:
-            return datetime.datetime.now() - datetime.timedelta(days=30)
+                return datetime.datetime.fromisoformat(json.load(f)["last_sync_date"])
     except Exception as e:
         logger.error(f"Error loading last sync date: {e}")
-        return datetime.datetime.now() - datetime.timedelta(days=30)
+    return datetime.datetime.now() - datetime.timedelta(days=30)
 
 
 def save_last_sync_date(sync_date: datetime.datetime) -> None:
-    """Save the last sync date to the JSON file."""
     try:
         with open(LAST_SYNC_FILE, "w") as f:
             json.dump({"last_sync_date": sync_date.isoformat()}, f)
@@ -347,188 +250,132 @@ def save_last_sync_date(sync_date: datetime.datetime) -> None:
         logger.error(f"Error saving last sync date: {e}")
 
 
-def activities_overlap(
-    start_time1: datetime.datetime,
-    duration1: int,
-    start_time2: datetime.datetime,
-    duration2: int,
-) -> bool:
-    """Check if two activities overlap in time (including a buffer)."""
-    end_time1 = start_time1 + datetime.timedelta(seconds=duration1)
-    end_time2 = start_time2 + datetime.timedelta(seconds=duration2)
-    buffer = datetime.timedelta(minutes=OVERLAP_BUFFER_MINUTES)
-
-    return (
-        (start_time1 - buffer <= start_time2 <= end_time1 + buffer)
-        or (start_time1 - buffer <= end_time2 <= end_time1 + buffer)
-        or (start_time2 - buffer <= start_time1 <= end_time2 + buffer)
-        or (start_time2 - buffer <= end_time1 <= end_time2 + buffer)
-    )
+def activities_overlap(st1, d1, st2, d2) -> bool:
+    e1 = st1 + datetime.timedelta(seconds=d1)
+    e2 = st2 + datetime.timedelta(seconds=d2)
+    buf = datetime.timedelta(minutes=OVERLAP_BUFFER_MINUTES)
+    return (st1 - buf <= st2 <= e1 + buf) or (st1 - buf <= e2 <= e1 + buf) or \
+           (st2 - buf <= st1 <= e2 + buf) or (st2 - buf <= e1 <= e2 + buf)
 
 
-def collect_activities_to_sync(
-    igpsport_client: IGPSportClient,
-    garmin_client: GarminClient,
-    last_sync_date: datetime.datetime,
-) -> List[Dict]:
-    """Collect and filter activities to sync."""
+def collect_activities_to_sync(igpsport_client, garmin_client, last_sync_date):
     garmin_activities = garmin_client.get_activities(limit=20)
-    garmin_activity_times = []
-    for activity in garmin_activities:
+    garmin_times = []
+    for act in garmin_activities:
         try:
-            start_time = parse(activity.get("startTimeLocal", ""))
-            duration = activity.get("duration", 0)
-            garmin_activity_times.append((start_time, duration))
+            start = parse(act.get("startTimeLocal", ""))
+            duration = act.get("duration", 0)
+            garmin_times.append((start, duration))
         except Exception as e:
-            logger.warning(f"Error parsing Garmin activity time: {e}")
+            logger.warning(f"Parse Garmin time error: {e}")
 
-    page_no = 1
-    page_size = 20
-    activities_data = igpsport_client.get_activities(page_no, page_size)
-
-    if not activities_data or "rows" not in activities_data:
-        logger.error("Failed to get activities from iGPSport")
+    data = igpsport_client.get_activities(1, 20)
+    if not data or "rows" not in data:
+        logger.error("No iGPSport activities")
         return []
 
-    activities = activities_data["rows"]
-    activities_to_sync = []
-
-    for activity in activities:
+    to_sync = []
+    for act in data["rows"]:
         try:
-            start_time_str = activity.get("startTime", "")
-            activity_id = activity.get("rideId")
-            if "." in start_time_str:
-                parts = start_time_str.split(".")
-                if len(parts) == 3:
-                    year, month, day = parts
-                    start_time = datetime.datetime(int(year), int(month), int(day))
-                else:
-                    logger.warning(f"Invalid date format: {start_time_str}")
-                    continue
+            start_str = act.get("startTime", "")
+            act_id = act.get("rideId")
+            if "." in start_str:
+                y, m, d = start_str.split(".")
+                start_date = datetime.datetime(int(y), int(m), int(d))
             else:
-                start_time = parse(start_time_str)
+                start_date = parse(start_str)
 
-            if start_time.date() < last_sync_date.date():
-                logger.info(
-                    f"Skipping activity {activity_id} from {start_time} (older than last sync)"
-                )
+            if start_date.date() < last_sync_date.date():
+                logger.info(f"Skipping {act_id} (older)")
                 continue
 
-            activity_detail = igpsport_client.get_activity_detail(activity_id)
-            if not activity_detail:
-                logger.warning(f"Could not get details for activity {activity_id}")
+            detail = igpsport_client.get_activity_detail(act_id)
+            if not detail:
                 continue
 
-            detail_start_time = parse(activity_detail.get("startTime", ""))
-            detail_duration = activity_detail.get("totalTime", 0)
+            det_start = parse(detail.get("startTime", ""))
+            det_dur = detail.get("totalTime", 0)
 
-            overlaps = False
-            for garmin_start, garmin_duration in garmin_activity_times:
-                if activities_overlap(
-                    detail_start_time, detail_duration, garmin_start, garmin_duration
-                ):
-                    logger.info(
-                        f"Skipping activity {activity_id} due to time overlap with existing Garmin activity"
-                    )
-                    overlaps = True
+            overlap = False
+            for gs, gd in garmin_times:
+                if activities_overlap(det_start, det_dur, gs, gd):
+                    overlap = True
                     break
-
-            if overlaps:
+            if overlap:
                 continue
 
-            fit_url = activity_detail.get("fitUrl")
+            fit_url = detail.get("fitUrl") or act.get("fitOssPath")
             if not fit_url:
-                fit_url = activity.get("fitOssPath")
-
-            if not fit_url:
-                logger.warning(f"No FIT file URL for activity {activity_id}")
                 continue
 
-            activities_to_sync.append(
-                {
-                    "activity_id": activity_id,
-                    "fit_url": fit_url,
-                    "start_time": detail_start_time,
-                    "duration": detail_duration,
-                }
-            )
-
+            to_sync.append({
+                "activity_id": act_id,
+                "fit_url": fit_url,
+                "start_time": det_start,
+                "duration": det_dur,
+            })
         except Exception as e:
             logger.error(f"Error processing activity: {e}")
-
-    return activities_to_sync
+    return to_sync
 
 
 def main():
-    """Main execution function."""
-    igpsport_username = os.environ.get("IGPSPORT_USERNAME")
-    igpsport_password = os.environ.get("IGPSPORT_PASSWORD")
+    igpsport_user = os.environ.get("IGPSPORT_USERNAME")
+    igpsport_pass = os.environ.get("IGPSPORT_PASSWORD")
     igpsport_region = os.environ.get("IGPSPORT_REGION")
     garmin_email = os.environ.get("GARMIN_EMAIL")
-    garmin_password = os.environ.get("GARMIN_PASSWORD")
+    garmin_pass = os.environ.get("GARMIN_PASSWORD")
     garmin_domain = os.environ.get("GARMIN_DOMAIN") or "com"
 
-    if not all([igpsport_username, igpsport_password, garmin_email, garmin_password]):
-        logger.error("Missing required environment variables")
+    if not all([igpsport_user, igpsport_pass, garmin_email, garmin_pass]):
+        logger.error("Missing environment variables")
         return
 
-    igpsport_client = IGPSportClient(igpsport_username, igpsport_password, igpsport_region)
-    garmin_client = GarminClient(garmin_email, garmin_password, garmin_domain)
+    igpsport = IGPSportClient(igpsport_user, igpsport_pass, igpsport_region)
+    garmin = GarminClient(garmin_email, garmin_pass, garmin_domain)
 
-    if not igpsport_client.login():
-        logger.error("Failed to authenticate with iGPSport")
+    if not igpsport.login():
+        logger.error("iGPSport login failed")
         return
 
-    last_sync_date = load_last_sync_date()
-    logger.info(f"Last sync date: {last_sync_date}")
+    last_sync = load_last_sync_date()
+    logger.info(f"Last sync date: {last_sync}")
 
-    activities_to_sync = collect_activities_to_sync(igpsport_client, garmin_client, last_sync_date)
-
-    if not activities_to_sync:
-        logger.info("No new activities to sync")
+    activities = collect_activities_to_sync(igpsport, garmin, last_sync)
+    if not activities:
+        logger.info("No new activities")
         return
 
-    logger.info(f"Found {len(activities_to_sync)} activities to sync")
+    logger.info(f"Found {len(activities)} activities to sync")
 
-    if not garmin_client.authenticate():
-        logger.error("Failed to authenticate with Garmin")
+    if not garmin.authenticate():
+        logger.error("Garmin authentication failed")
         return
 
-    sync_count = 0
-    latest_synced_date = None
-
-    for activity_info in activities_to_sync:
-        activity_id = activity_info["activity_id"]
-        fit_url = activity_info["fit_url"]
-        start_time = activity_info["start_time"]
-
-        fit_data = igpsport_client.download_fit_file(fit_url)
+    synced = 0
+    latest_date = None
+    for act in activities:
+        fit_data = igpsport.download_fit_file(act["fit_url"])
         if not fit_data:
-            logger.warning(f"Failed to download FIT file for activity {activity_id}")
+            logger.warning(f"Download failed for {act['activity_id']}")
             continue
-
-        result = garmin_client.upload_fit(fit_data)
+        result = garmin.upload_fit(fit_data)
         if result:
-            logger.info(f"Successfully uploaded activity {activity_id} to Garmin")
-            sync_count += 1
-            if latest_synced_date is None or start_time > latest_synced_date:
-                latest_synced_date = start_time
+            synced += 1
+            if latest_date is None or act["start_time"] > latest_date:
+                latest_date = act["start_time"]
             time.sleep(2)
         else:
-            logger.warning(f"Failed to upload activity {activity_id} to Garmin after all retry attempts")
+            logger.warning(f"Upload failed for {act['activity_id']}")
 
-        if latest_synced_date and sync_count > 0:
-            save_last_sync_date(latest_synced_date)
+        if latest_date and synced > 0:
+            save_last_sync_date(latest_date)
 
-    if latest_synced_date and sync_count > 0:
-        save_last_sync_date(latest_synced_date)
-        logger.info(f"Updated last sync date to: {latest_synced_date}")
-    else:
-        logger.info("No activities were synced, last sync date remains unchanged")
+    if latest_date and synced > 0:
+        save_last_sync_date(latest_date)
+        logger.info(f"Updated last sync date to {latest_date}")
 
-    logger.info(
-        f"Sync completed: {sync_count} activities uploaded, {len(activities_to_sync) - sync_count} activities failed"
-    )
+    logger.info(f"Done: {synced}/{len(activities)} uploaded")
 
 
 if __name__ == "__main__":
