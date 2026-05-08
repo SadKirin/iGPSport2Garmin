@@ -2,8 +2,8 @@ name: iGPSport to Garmin Sync
 
 on:
   schedule:
-    - cron: '0 */6 * * *'
-  workflow_dispatch:
+    - cron: '0 */6 * * *'  # 每6小时运行一次
+  workflow_dispatch:        # 允许手动触发
 
 jobs:
   sync:
@@ -26,11 +26,14 @@ jobs:
           restore-keys: |
             ${{ runner.os }}-pip-
 
-      - name: Restore Garmin token cache
+      # 缓存 Garmin Token，避免每次运行都重新登录
+      - name: Cache Garmin tokens
         uses: actions/cache@v4
         with:
-          path: garmin_token.json
-          key: ${{ runner.os }}-garmin-token-${{ github.run_id }}
+          # python-garminconnect 0.3.0+ 默认将 token 存在 ~/.garminconnect/
+          # 为了在 Job 间持久化，我们缓存整个目录
+          path: ~/.garminconnect
+          key: ${{ runner.os }}-garmin-token
           restore-keys: |
             ${{ runner.os }}-garmin-token-
           
@@ -46,6 +49,8 @@ jobs:
           IGPSPORT_REGION: ${{ secrets.IGPSPORT_REGION || 'cn' }}
           GARMIN_EMAIL: ${{ secrets.GARMIN_EMAIL }}
           GARMIN_PASSWORD: ${{ secrets.GARMIN_PASSWORD }}
+          # 可根据你的账号区域选择 'cn' 或 'com'
+          GARMIN_DOMAIN: ${{ secrets.GARMIN_DOMAIN || 'com' }}
         run: python sync_igpsport_to_garmin.py
         
       - name: Commit changes
@@ -55,10 +60,8 @@ jobs:
           if [ -f last_sync_date.json ]; then
             git add last_sync_date.json
           fi
-          if [ -f garmin_token.json ]; then
-            git add garmin_token.json
-          fi
-          git diff --quiet && git diff --staged --quiet || git commit -m "Update last sync date and token [skip ci]"
+          # 使用新库后，不再需要手动添加 token 文件到仓库
+          git diff --quiet && git diff --staged --quiet || git commit -m "Update last sync date [skip ci]"
           
       - name: Push changes
         uses: ad-m/github-push-action@master
