@@ -11,13 +11,14 @@ import json
 import time
 import random
 import datetime
-import requests
-import tempfile
+from pathlib import Path
 import logging
 from dateutil.parser import parse
 from typing import Dict, List, Optional
 
-from ha_garmin import GarminAuth, GarminClient as HaGarminClient, GarminMFARequired
+import garminconnect
+from garminconnect import Garmin
+from requests import Session, get as requests_get
 
 # Configure logging
 logging.basicConfig(
@@ -60,7 +61,7 @@ class IGPSportClient:
 
         region_cfg = self.REGION_CONFIG[self.region]
         self.base_url = region_cfg["base_url"]
-        self.session = requests.Session()
+        self.session = Session()
         self.session.headers.update(
             {
                 "user-agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/133.0.0.0 Safari/537.36",
@@ -150,7 +151,7 @@ class IGPSportClient:
     def download_fit_file(self, fit_url: str) -> Optional[bytes]:
         """Download a FIT file from the given URL."""
         try:
-            response = requests.get(fit_url)
+            response = requests_get(fit_url)
             response.raise_for_status()
             return response.content
         except Exception as e:
@@ -159,26 +160,32 @@ class IGPSportClient:
 
 
 class GarminClient:
-    """Client for Garmin Connect API using the ha-garmin library."""
+    """
+    Client for Garmin Connect API using the python-garminconnect library.
+
+    Uses version 0.3.0+ for native auth engine, token management and cloudflare bypass.
+    """
 
     def __init__(
         self,
         email: str,
         password: str,
+        domain: str,
         max_retries: int = 3,
         retry_delay: int = 5,
     ):
         self.email = email
         self.password = password
+        # domain 形如 'cn' 或 'com'
+        self.domain = domain
         self.max_retries = max_retries
         self.retry_delay = retry_delay
-        self.auth = None
-        self.client = None
+        self.client: Optional[Garmin] = None
         self.authenticated = False
 
     def authenticate(self, force: bool = False) -> bool:
         """
-        Authenticate with Garmin Connect using ha-garmin.
+        Authenticate with Garmin Connect.
 
         Args:
             force: If True, force a new authentication even if a token exists
@@ -186,38 +193,37 @@ class GarminClient:
         Returns:
             True if authentication is successful, False otherwise
         """
-        token_file = "garmin_token.json"
-        self.auth = GarminAuth()
-
         try:
-            # Try to load existing session
-            if not force and self.auth.load_session(token_file):
-                logger.info("Loaded Garmin session from token file")
-            else:
-                logger.info("No valid token found. Performing new Garmin authentication...")
-                self.auth.login(self.email, self.password)
-                # Handle MFA if needed (in GitHub Actions, interactive input is not possible,
-                # so we assume no MFA or use app password; if MFA is required, the script will fail.
-                # For headless environments, it's recommended to disable MFA or use application-specific password)
-                self.auth.save_session(token_file)
-
-            self.client = HaGarminClient(self.auth)
+            # 新版库会根据 domain 参数自动决定使用 garmin.com 还是 garmin.cn
+            # is_cn=None 时 domain 参数必须为 'cn' 或 'com'，库内部会自动判断
+            # 如果明确是大陆账号，可以设置 is_cn=True
+            is_cn = (self.domain == 'cn')
+            logger.info(f"Logging in to Garmin {'CN' if is_cn else 'global'} region...")
+            
+            # 创建 Garmin 对象，并使用 token 存储
+            token_store_path = os.path.expanduser("~/.garminconnect")
+            # 新版库在初始化时就会尝试加载 ~/.garminconnect 下的 token
+            self.client = Garmin(
+                email=self.email,
+                password=self.password,
+                is_cn=is_cn,
+                session_data=None  # 不显式提供，让库自动处理持久化
+            )
+            
+            # 调用 login()，它会自动处理网络请求、token 刷新等
+            # 如果之前有有效 token，会自动复用；否则会使用账号密码全新登录
+            self.client.login()
+            
+            # 可选：验证登录是否成功
+            self.client.get_full_name()
+            logger.info("Successfully authenticated with Garmin Connect")
             self.authenticated = True
             return True
 
-        except GarminMFARequired:
-            logger.error("MFA required but cannot interact in headless environment. "
-                         "Please disable MFA or use an application-specific password.")
-            self.authenticated = False
-            return False
         except Exception as e:
             logger.error(f"Error authenticating with Garmin Connect: {e}")
             self.authenticated = False
-            # If token file exists and we're not forcing, remove it and retry once
-            if not force and os.path.exists(token_file):
-                logger.info("Token file may be corrupted, removing and retrying...")
-                os.remove(token_file)
-                return self.authenticate(force=True)
+            self.client = None
             return False
 
     def get_activities(self, start_date: Optional[datetime.datetime] = None, limit: int = 10) -> List[Dict]:
@@ -227,16 +233,16 @@ class GarminClient:
             return []
 
         try:
-            # Fetch activities for the last 30 days by default
-            from datetime import date, timedelta
-            end_date = date.today()
-            start_date = end_date - timedelta(days=30)
-            raw_data = self.client.fetch_activity_data(start_date, end_date)
-            activities = raw_data.get('activities', [])
-            return activities[:limit]
+            # get_activities 返回一个 list，默认按时间倒序（最新的在前）
+            activities = self.client.get_activities(start=0, limit=limit)
+            if isinstance(activities, list):
+                return activities
+            else:
+                logger.warning(f"Unexpected type for activities: {type(activities)}")
+                return []
         except Exception as e:
             logger.error(f"Error getting activities from Garmin Connect: {e}")
-            # Try re-authentication
+            # 尝试重新认证
             self.authenticated = False
             if self.authenticate(force=True):
                 return self.get_activities(start_date, limit)
@@ -248,7 +254,7 @@ class GarminClient:
 
         Args:
             fit_data: The binary FIT file data
-            activity_name: Optional name for the activity (not directly used)
+            activity_name: Optional name for the activity (not directly used by upload)
 
         Returns:
             Dict with upload response or None if all attempts failed
@@ -270,19 +276,28 @@ class GarminClient:
                     )
                     time.sleep(delay)
 
-                # Write binary data to temporary file
+                # 将二进制数据写入临时 .fit 文件
                 with tempfile.NamedTemporaryFile(suffix=".fit", delete=False) as tmp_file:
                     tmp_file.write(fit_data)
                     tmp_path = tmp_file.name
 
-                # Upload using internal API of ha-garmin
-                upload_response = self.client._api.upload_activity(tmp_path)
+                # 上传文件
+                # upload_activity 返回内容: 如果成功通常包含 uploadId 等
+                upload_response = self.client.upload_activity(tmp_path)
+                
+                # 可选：如果提供了活动名称，尝试修改
+                if activity_name and upload_response and "activityId" in upload_response:
+                    try:
+                        self.client.set_activity_description(upload_response["activityId"], activity_name)
+                        logger.info(f"Renamed activity to '{activity_name}'")
+                    except Exception as e:
+                        logger.warning(f"Failed to rename activity: {e}")
 
-                # Clean up temp file
+                # 清理临时文件
                 if tmp_path and os.path.exists(tmp_path):
                     os.unlink(tmp_path)
-
-                logger.info(f"Successfully uploaded activity to Garmin Connect: {upload_response}")
+                    
+                logger.info(f"Successfully uploaded activity to Garmin Connect")
                 return upload_response
 
             except Exception as e:
@@ -292,27 +307,27 @@ class GarminClient:
                     f"Upload attempt {retries} failed: {activity_name or 'Unknown Activity'}, {len(fit_data)} bytes, {e}"
                 )
 
-                # Authentication errors -> force re-login
+                # 认证相关错误 -> 强制重新登录
                 error_str = str(e).lower()
-                if "auth" in error_str or "login" in error_str or "token" in error_str or "401" in error_str:
+                if "auth" in error_str or "login" in error_str or "token" in error_str:
                     logger.info("Authentication issue detected. Re-authenticating...")
                     self.authenticated = False
                     self.authenticate(force=True)
 
-                # Rate limiting -> extra delay
+                # 速率限制 -> 额外延迟
                 if "429" in error_str or "rate" in error_str:
                     extra_delay = 30 + random.uniform(0, 10)
                     logger.warning(f"Rate limiting detected. Adding {extra_delay:.2f}s delay...")
                     time.sleep(extra_delay)
 
-                # 409 Conflict -> duplicate activity, skip this one
+                # 409 Conflict 表示活动可能已存在（重复上传），跳过此活动
                 if "409" in error_str or "conflict" in error_str:
                     logger.warning("409 Conflict detected. Skipping activity.")
                     if tmp_path and os.path.exists(tmp_path):
                         os.unlink(tmp_path)
                     return None
 
-                # Clean up temp file if it exists and this wasn't the last retry
+                # 清理临时文件
                 if tmp_path and os.path.exists(tmp_path):
                     try:
                         os.unlink(tmp_path)
@@ -320,7 +335,7 @@ class GarminClient:
                         pass
                     tmp_path = None
 
-        # After all retries exhausted
+        # 所有重试尝试失败
         if tmp_path and os.path.exists(tmp_path):
             os.unlink(tmp_path)
 
@@ -336,10 +351,11 @@ def load_last_sync_date() -> datetime.datetime:
                 data = json.load(f)
                 return datetime.datetime.fromisoformat(data["last_sync_date"])
         else:
-            # Default to 30 days ago if no sync file exists
+            # 默认同步最近 30 天的数据
             return datetime.datetime.now() - datetime.timedelta(days=30)
     except Exception as e:
         logger.error(f"Error loading last sync date: {e}")
+        # 出错时默认30天
         return datetime.datetime.now() - datetime.timedelta(days=30)
 
 
@@ -358,12 +374,13 @@ def activities_overlap(
     start_time2: datetime.datetime,
     duration2: int,
 ) -> bool:
-    """Check if two activities overlap in time."""
+    """Check if two activities overlap in time (including a buffer)."""
     end_time1 = start_time1 + datetime.timedelta(seconds=duration1)
     end_time2 = start_time2 + datetime.timedelta(seconds=duration2)
 
     buffer = datetime.timedelta(minutes=OVERLAP_BUFFER_MINUTES)
 
+    # 检查两个时间段是否有重叠（带缓冲）
     return (
         (start_time1 - buffer <= start_time2 <= end_time1 + buffer)
         or (start_time1 - buffer <= end_time2 <= end_time1 + buffer)
@@ -378,7 +395,7 @@ def collect_activities_to_sync(
     last_sync_date: datetime.datetime,
 ) -> List[Dict]:
     """Collect and filter activities to sync."""
-    # Get recent activities from Garmin to check for overlap
+    # 获取最近的一些 Garmin 活动用于去重判断
     garmin_activities = garmin_client.get_activities(limit=20)
     garmin_activity_times = []
     for activity in garmin_activities:
@@ -389,7 +406,7 @@ def collect_activities_to_sync(
         except Exception as e:
             logger.warning(f"Error parsing Garmin activity time: {e}")
 
-    # Get activities from iGPSport
+    # 获取 iGPSport 的活动列表
     page_no = 1
     page_size = 20
     activities_data = igpsport_client.get_activities(page_no, page_size)
@@ -403,8 +420,10 @@ def collect_activities_to_sync(
 
     for activity in activities:
         try:
+            # 分析 iGPSport 活动的时间
             start_time_str = activity.get("startTime", "")
             activity_id = activity.get("rideId")
+            # 处理类似 "2024.11.20" 的非标准格式
             if "." in start_time_str:
                 parts = start_time_str.split(".")
                 if len(parts) == 3:
@@ -416,10 +435,14 @@ def collect_activities_to_sync(
             else:
                 start_time = parse(start_time_str)
 
+            # 只同步上次同步日期之后的活动
             if start_time.date() < last_sync_date.date():
-                logger.info(f"Skipping activity {activity_id} from {start_time} (older than last sync)")
+                logger.info(
+                    f"Skipping activity {activity_id} from {start_time} (older than last sync)"
+                )
                 continue
 
+            # 获取活动详情（包含更精准的时间、时长、fit文件链接）
             activity_detail = igpsport_client.get_activity_detail(activity_id)
             if not activity_detail:
                 logger.warning(f"Could not get details for activity {activity_id}")
@@ -428,16 +451,22 @@ def collect_activities_to_sync(
             detail_start_time = parse(activity_detail.get("startTime", ""))
             detail_duration = activity_detail.get("totalTime", 0)
 
+            # 检查是否与已有 Garmin 活动时间重叠
             overlaps = False
             for garmin_start, garmin_duration in garmin_activity_times:
-                if activities_overlap(detail_start_time, detail_duration, garmin_start, garmin_duration):
-                    logger.info(f"Skipping activity {activity_id} due to time overlap with existing Garmin activity")
+                if activities_overlap(
+                    detail_start_time, detail_duration, garmin_start, garmin_duration
+                ):
+                    logger.info(
+                        f"Skipping activity {activity_id} due to time overlap with existing Garmin activity"
+                    )
                     overlaps = True
                     break
 
             if overlaps:
                 continue
 
+            # 获取 FIT 文件的 URL
             fit_url = activity_detail.get("fitUrl")
             if not fit_url:
                 fit_url = activity.get("fitOssPath")
@@ -446,12 +475,14 @@ def collect_activities_to_sync(
                 logger.warning(f"No FIT file URL for activity {activity_id}")
                 continue
 
-            activities_to_sync.append({
-                "activity_id": activity_id,
-                "fit_url": fit_url,
-                "start_time": detail_start_time,
-                "duration": detail_duration,
-            })
+            activities_to_sync.append(
+                {
+                    "activity_id": activity_id,
+                    "fit_url": fit_url,
+                    "start_time": detail_start_time,
+                    "duration": detail_duration,
+                }
+            )
 
         except Exception as e:
             logger.error(f"Error processing activity: {e}")
@@ -461,28 +492,44 @@ def collect_activities_to_sync(
 
 def main():
     """Main execution function."""
+    # 读取环境变量
     igpsport_username = os.environ.get("IGPSPORT_USERNAME")
     igpsport_password = os.environ.get("IGPSPORT_PASSWORD")
     igpsport_region = os.environ.get("IGPSPORT_REGION")
     garmin_email = os.environ.get("GARMIN_EMAIL")
     garmin_password = os.environ.get("GARMIN_PASSWORD")
+    garmin_domain = os.environ.get("GARMIN_DOMAIN") or "com"
 
-    if not all([igpsport_username, igpsport_password, garmin_email, garmin_password]):
+    if not all(
+        [
+            igpsport_username,
+            igpsport_password,
+            garmin_email,
+            garmin_password,
+        ]
+    ):
         logger.error("Missing required environment variables")
         return
 
-    # Initialize clients
-    igpsport_client = IGPSportClient(igpsport_username, igpsport_password, igpsport_region)
-    garmin_client = GarminClient(garmin_email, garmin_password)
+    # 初始化客户端
+    igpsport_client = IGPSportClient(
+        igpsport_username, igpsport_password, igpsport_region
+    )
+    garmin_client = GarminClient(garmin_email, garmin_password, garmin_domain)
 
+    # 登录 iGPSport
     if not igpsport_client.login():
         logger.error("Failed to authenticate with iGPSport")
         return
 
+    # 上次同步日期
     last_sync_date = load_last_sync_date()
     logger.info(f"Last sync date: {last_sync_date}")
 
-    activities_to_sync = collect_activities_to_sync(igpsport_client, garmin_client, last_sync_date)
+    # 筛选需要同步的活动（可能触发 Garmin 认证）
+    activities_to_sync = collect_activities_to_sync(
+        igpsport_client, garmin_client, last_sync_date
+    )
 
     if not activities_to_sync:
         logger.info("No new activities to sync")
@@ -490,6 +537,7 @@ def main():
 
     logger.info(f"Found {len(activities_to_sync)} activities to sync")
 
+    # 确保 Garmin 已认证
     if not garmin_client.authenticate():
         logger.error("Failed to authenticate with Garmin")
         return
@@ -497,36 +545,49 @@ def main():
     sync_count = 0
     latest_synced_date = None
 
+    # 逐一上传
     for activity_info in activities_to_sync:
         activity_id = activity_info["activity_id"]
         fit_url = activity_info["fit_url"]
         start_time = activity_info["start_time"]
 
+        # 下载 FIT 文件
         fit_data = igpsport_client.download_fit_file(fit_url)
         if not fit_data:
             logger.warning(f"Failed to download FIT file for activity {activity_id}")
             continue
 
+        # 上传到 Garmin
         result = garmin_client.upload_fit(fit_data)
         if result:
             logger.info(f"Successfully uploaded activity {activity_id} to Garmin")
             sync_count += 1
+
+            # 更新最新的同步日期
             if latest_synced_date is None or start_time > latest_synced_date:
                 latest_synced_date = start_time
+
+            # 避免请求过频
             time.sleep(2)
         else:
-            logger.warning(f"Failed to upload activity {activity_id} to Garmin after all retry attempts")
+            logger.warning(
+                f"Failed to upload activity {activity_id} to Garmin after all retry attempts"
+            )
 
+        # 每次成功上传后都保存进度，避免中断后全部重新上传
         if latest_synced_date and sync_count > 0:
             save_last_sync_date(latest_synced_date)
 
+    # 最终更新
     if latest_synced_date and sync_count > 0:
         save_last_sync_date(latest_synced_date)
         logger.info(f"Updated last sync date to: {latest_synced_date}")
     else:
         logger.info("No activities were synced, last sync date remains unchanged")
 
-    logger.info(f"Sync completed: {sync_count} activities uploaded, {len(activities_to_sync) - sync_count} activities failed")
+    logger.info(
+        f"Sync completed: {sync_count} activities uploaded, {len(activities_to_sync) - sync_count} activities failed"
+    )
 
 
 if __name__ == "__main__":
