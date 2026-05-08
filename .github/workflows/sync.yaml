@@ -14,22 +14,22 @@ jobs:
         uses: actions/checkout@v4
         
       - name: Set up Python
-        uses: actions/setup-python@v4
+        uses: actions/setup-python@v5
         with:
           python-version: '3.12'
           
       - name: Cache pip dependencies
-        uses: actions/cache@v3
+        uses: actions/cache@v4
         with:
           path: ~/.cache/pip
           key: ${{ runner.os }}-pip-${{ hashFiles('**/requirements.txt') }}
           restore-keys: |
             ${{ runner.os }}-pip-
 
-      - name: Restore Garmin token store
-        uses: actions/cache@v3
+      - name: Restore Garmin token cache
+        uses: actions/cache@v4
         with:
-          path: garmin_token_store
+          path: garmin_token.json
           key: ${{ runner.os }}-garmin-token-${{ github.run_id }}
           restore-keys: |
             ${{ runner.os }}-garmin-token-
@@ -46,7 +46,6 @@ jobs:
           IGPSPORT_REGION: ${{ secrets.IGPSPORT_REGION || 'cn' }}
           GARMIN_EMAIL: ${{ secrets.GARMIN_EMAIL }}
           GARMIN_PASSWORD: ${{ secrets.GARMIN_PASSWORD }}
-          GARMIN_DOMAIN: ${{ secrets.GARMIN_DOMAIN || 'garmin.com' }}
         run: python sync_igpsport_to_garmin.py
         
       - name: Commit changes
@@ -55,8 +54,11 @@ jobs:
           git config --local user.name "GitHub Action"
           if [ -f last_sync_date.json ]; then
             git add last_sync_date.json
-            git diff --quiet && git diff --staged --quiet || git commit -m "Update last sync date [skip ci]"
           fi
+          if [ -f garmin_token.json ]; then
+            git add garmin_token.json
+          fi
+          git diff --quiet && git diff --staged --quiet || git commit -m "Update last sync date and token [skip ci]"
           
       - name: Push changes
         uses: ad-m/github-push-action@master
