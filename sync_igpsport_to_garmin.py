@@ -517,7 +517,7 @@ def main():
     igpsport_region = os.environ.get("IGPSPORT_REGION")
     garmin_email = os.environ.get("GARMIN_EMAIL")
     garmin_password = os.environ.get("GARMIN_PASSWORD")
-    garmin_domain = os.environ.get("GARMIN_DOMAIN") or "garmin.com"
+    garmin_domain = os.environ.get("GARMIN_DOMAIN") or "garmin.cn"
 
     # Log the session file location for debugging
     logger.info(
