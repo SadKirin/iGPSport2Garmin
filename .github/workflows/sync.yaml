@@ -26,10 +26,10 @@ jobs:
           restore-keys: |
             ${{ runner.os }}-pip-
 
-      - name: Restore Garmin token file
+      - name: Restore Garmin token store
         uses: actions/cache@v3
         with:
-          path: garmin_token.json
+          path: garmin_token_store
           key: ${{ runner.os }}-garmin-token-${{ github.run_id }}
           restore-keys: |
             ${{ runner.os }}-garmin-token-
