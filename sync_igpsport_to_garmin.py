@@ -13,11 +13,12 @@ import random
 import datetime
 import requests
 import tempfile
-import garth
 from pathlib import Path
 import logging
 from dateutil.parser import parse
 from typing import Dict, List, Optional, Tuple, Any
+
+from garminconnect import GarminConnect
 
 # Configure logging
 logging.basicConfig(
@@ -28,7 +29,7 @@ logger = logging.getLogger("igpsport-to-garmin")
 # Constants
 LAST_SYNC_FILE = "last_sync_date.json"
 OVERLAP_BUFFER_MINUTES = 5  # Consider activities overlapping if within 5 minutes
-GARMIN_SESSION_DIR = "garmin_session"  # Dir to store Garmin session data
+GARMIN_TOKEN_FILE = "garmin_token.json"  # File to store Garmin token
 
 
 class IGPSportClient:
@@ -160,7 +161,7 @@ class IGPSportClient:
 
 
 class GarminClient:
-    """Client for the Garmin Connect API using the garth library."""
+    """Client for Garmin Connect API using the python-garminconnect library."""
 
     def __init__(
         self,
@@ -172,9 +173,10 @@ class GarminClient:
     ):
         self.email = email
         self.password = password
-        self.domain = domain
+        self.domain = domain   # e.g., "garmin.cn" or "garmin.com"
         self.max_retries = max_retries
         self.retry_delay = retry_delay
+        self.client = None
         self.authenticated = False
 
     def authenticate(self, force: bool = False) -> bool:
@@ -182,88 +184,57 @@ class GarminClient:
         Authenticate with Garmin Connect.
 
         Args:
-            force: If True, force a new authentication even if a session exists
+            force: If True, force a new authentication even if a token exists
 
         Returns:
             True if authentication is successful, False otherwise
         """
         try:
-            # Try to load session from file first
-            if not force and self._load_session():
-                logger.info("Loaded existing Garmin session from cache")
-                self.authenticated = True
-                return True
+            # Initialize client with token store (file)
+            # If force=True, we don't load any existing token
+            token_store = None if force else GARMIN_TOKEN_FILE
 
-            # Perform a new login
-            logger.info("Performing new Garmin authentication")
-            garth.login(self.email, self.password)
+            self.client = GarminConnect(
+                email=self.email,
+                password=self.password,
+                domain=self.domain,
+                token_store=token_store,
+            )
 
-            # Save the session for future use
-            self._save_session()
-
+            # login() will try to use stored token; if invalid or force=True, it will re-login
+            self.client.login()
             logger.info("Successfully authenticated with Garmin Connect")
             self.authenticated = True
             return True
+
         except Exception as e:
             logger.error(f"Error authenticating with Garmin Connect: {e}")
             self.authenticated = False
+            self.client = None
+
+            # If token file exists and we weren't forcing, try removing it and retry once
+            if not force and os.path.exists(GARMIN_TOKEN_FILE):
+                logger.info("Token file may be corrupted, removing and retrying...")
+                os.remove(GARMIN_TOKEN_FILE)
+                return self.authenticate(force=True)
             return False
 
-    def _save_session(self) -> bool:
-        """Save the current Garmin session to a directory."""
+    def get_activities(self, start_date: Optional[datetime.datetime] = None, limit: int = 10) -> List[Dict]:
+        """Get recent activities from Garmin Connect."""
+        if not self.authenticated and not self.authenticate():
+            logger.error("Cannot get activities: Not authenticated with Garmin")
+            return []
+
         try:
-            os.makedirs(GARMIN_SESSION_DIR, exist_ok=True)
-            garth.save(GARMIN_SESSION_DIR)
-            logger.info(f"Garmin session saved to directory: {GARMIN_SESSION_DIR}")
-            return True
-        except Exception as e:
-            logger.error(f"Error saving Garmin session: {e}")
-            return False
-
-    def _load_session(self) -> bool:
-        """Load a saved Garmin session from directory."""
-        try:
-            if not os.path.exists(GARMIN_SESSION_DIR) or not os.path.isdir(
-                GARMIN_SESSION_DIR
-            ):
-                logger.info("No saved Garmin session directory found")
-                return False
-
-            garth.resume(GARMIN_SESSION_DIR)
-
-            try:
-                garth.client.username
-                logger.info("Loaded Garmin session is valid")
-                return True
-            except Exception as e:
-                logger.info(f"Loaded Garmin session is invalid or expired: {e}")
-                return False
-
-        except Exception as e:
-            logger.error(f"Error loading Garmin session: {e}")
-            return False
-
-    def get_activities(
-        self, start_date: Optional[datetime.datetime] = None, limit: int = 10
-    ) -> List[Dict]:
-        """Get activities from Garmin Connect."""
-        try:
-            # Ensure we're authenticated
-            if not self.authenticated and not self.authenticate():
-                return []
-
-            # Build the params
-            params = {"start": 0, "limit": limit}
-
-            # Make the request to the Garmin Connect API
-            response = garth.connectapi(
-                "/activitylist-service/activities/search/activities", params=params
-            )
-            return response if isinstance(response, list) else []
+            # get_activities(start, limit) returns list, newest first
+            activities = self.client.get_activities(0, limit)
+            return activities if isinstance(activities, list) else []
         except Exception as e:
             logger.error(f"Error getting activities from Garmin Connect: {e}")
-            # Try to re-authenticate on error
-            self.authenticate(force=True)
+            # Try re-authentication
+            self.authenticated = False
+            if self.authenticate(force=True):
+                return self.get_activities(start_date, limit)
             return []
 
     def upload_fit(self, fit_data: bytes, activity_name: str = None) -> Optional[Dict]:
@@ -277,84 +248,86 @@ class GarminClient:
         Returns:
             Dict with upload response or None if all attempts failed
         """
-        retries = 0
-        last_error = None
-
-        # Ensure we're authenticated before attempting upload
         if not self.authenticated and not self.authenticate():
             logger.error("Cannot upload activity: Not authenticated with Garmin")
             return None
 
+        retries = 0
+        last_error = None
+        tmp_path = None
+
         while retries <= self.max_retries:
             try:
                 if retries > 0:
-                    delay = (self.retry_delay * (2 ** (retries - 1))) + random.uniform(
-                        0, 2
-                    )
+                    delay = (self.retry_delay * (2 ** (retries - 1))) + random.uniform(0, 2)
                     logger.info(
                         f"Retrying upload (attempt {retries}/{self.max_retries}) after {delay:.2f}s delay..."
                     )
                     time.sleep(delay)
 
-                with tempfile.NamedTemporaryFile(
-                    suffix=".fit", delete=False
-                ) as temp_file:
-                    temp_file.write(fit_data)
-                    temp_file_path = temp_file.name
+                # Write binary data to temporary file
+                with tempfile.NamedTemporaryFile(suffix=".fit", delete=False) as tmp_file:
+                    tmp_file.write(fit_data)
+                    tmp_path = tmp_file.name
 
-                with open(temp_file_path, "rb") as f:
-                    uploaded = garth.client.upload(f)
+                # Upload the activity
+                response = self.client.upload_activity(tmp_path)
 
-                os.unlink(temp_file_path)
+                # Optionally set activity name
+                if activity_name and response and "activityId" in response:
+                    try:
+                        self.client.update_activity(response["activityId"], {"name": activity_name})
+                        logger.info(f"Renamed activity to '{activity_name}'")
+                    except Exception as e:
+                        logger.warning(f"Failed to rename activity: {e}")
 
-                # Save the session after successful upload to maintain freshness
-                self._save_session()
+                # Clean up temp file
+                if tmp_path and os.path.exists(tmp_path):
+                    os.unlink(tmp_path)
 
-                logger.info(
-                    f"Successfully uploaded activity to Garmin Connect: {uploaded}"
-                )
-                return uploaded
+                logger.info(f"Successfully uploaded activity to Garmin Connect: {response}")
+                return response
 
             except Exception as e:
                 last_error = e
                 retries += 1
                 logger.warning(
-                    f"Upload attempt {retries} failed with error: {activity_name or 'Unknown Activity'}, {len(fit_data)} bytes, {e}"
+                    f"Upload attempt {retries} failed: {activity_name or 'Unknown Activity'}, {len(fit_data)} bytes, {e}"
                 )
 
-                # Only re-authenticate when specifically needed
-                if (
-                    "authentication" in str(e).lower()
-                    or "unauthorized" in str(e).lower()
-                    or "expired" in str(e).lower()
-                ):
-                    logger.info(
-                        "Authentication issue detected. Attempting to re-authenticate..."
-                    )
-                    try:
-                        self.authenticate(force=True)
-                    except Exception as auth_err:
-                        logger.error(f"Re-authentication failed: {auth_err}")
+                # Authentication errors -> force re-login
+                error_str = str(e).lower()
+                if "auth" in error_str or "login" in error_str or "token" in error_str:
+                    logger.info("Authentication issue detected. Re-authenticating...")
+                    self.authenticated = False
+                    self.authenticate(force=True)
 
-                # Rate limiting detection - longer backoff
-                if "rate" in str(e).lower() or "too many" in str(e).lower():
+                # Rate limiting -> extra delay
+                if "429" in error_str or "rate" in error_str:
                     extra_delay = 30 + random.uniform(0, 10)
-                    logger.warning(
-                        f"Rate limiting detected. Adding extra delay of {extra_delay:.2f}s..."
-                    )
+                    logger.warning(f"Rate limiting detected. Adding {extra_delay:.2f}s delay...")
                     time.sleep(extra_delay)
 
-                # 409 Conflict detection - skip this activity and continue
-                if "409" in str(e).lower() or "conflict" in str(e).lower():
-                    logger.warning(f"409 Conflict detected. Skipping activity {activity_name}")
+                # 409 Conflict -> duplicate activity, skip this one
+                if "409" in error_str or "conflict" in error_str:
+                    logger.warning("409 Conflict detected. Skipping activity.")
+                    if tmp_path and os.path.exists(tmp_path):
+                        os.unlink(tmp_path)
                     return None
 
-                if retries > self.max_retries:
-                    logger.error(
-                        f"Failed to upload after {self.max_retries} attempts. Last error: {last_error}"
-                    )
-                    return None
+                # Clean up temp file if it exists and this wasn't the last retry
+                if tmp_path and os.path.exists(tmp_path):
+                    try:
+                        os.unlink(tmp_path)
+                    except Exception:
+                        pass
+                    tmp_path = None
 
+        # After all retries exhausted
+        if tmp_path and os.path.exists(tmp_path):
+            os.unlink(tmp_path)
+
+        logger.error(f"Failed to upload after {self.max_retries} attempts. Last error: {last_error}")
         return None
 
 
@@ -439,7 +412,6 @@ def collect_activities_to_sync(
             start_time_str = activity.get("startTime", "")
             activity_id = activity.get("rideId")
             # Handle the format like "2024.11.20" which is not ISO format
-            # We'll need to convert it to proper datetime
             if "." in start_time_str:
                 parts = start_time_str.split(".")
                 if len(parts) == 3:
@@ -484,8 +456,7 @@ def collect_activities_to_sync(
             if overlaps:
                 continue
 
-            # Add to list of activities to sync
-            # Modified: Get fitUrl from activity_detail instead of activity due to iGPSport API change
+            # Get FIT URL from activity_detail (or fallback to activity)
             fit_url = activity_detail.get("fitUrl")
             if not fit_url:
                 fit_url = activity.get("fitOssPath")
@@ -519,14 +490,11 @@ def main():
     garmin_password = os.environ.get("GARMIN_PASSWORD")
     garmin_domain = os.environ.get("GARMIN_DOMAIN") or "garmin.cn"
 
-    # Log the session file location for debugging
-    logger.info(
-        f"Garmin session directory location: {os.path.abspath(GARMIN_SESSION_DIR)}"
-    )
-    if os.path.exists(GARMIN_SESSION_DIR):
-        logger.info(f"Garmin session directory exists")
+    logger.info(f"Garmin token file location: {os.path.abspath(GARMIN_TOKEN_FILE)}")
+    if os.path.exists(GARMIN_TOKEN_FILE):
+        logger.info("Garmin token file exists")
     else:
-        logger.info("Garmin session directory does not exist yet")
+        logger.info("Garmin token file does not exist yet")
 
     if not all(
         [
@@ -555,7 +523,7 @@ def main():
     last_sync_date = load_last_sync_date()
     logger.info(f"Last sync date: {last_sync_date}")
 
-    # Collect activities to sync without authenticating with Garmin yet
+    # Collect activities to sync (this may trigger Garmin authentication for overlap check)
     activities_to_sync = collect_activities_to_sync(
         igpsport_client, garmin_client, last_sync_date
     )
@@ -566,7 +534,7 @@ def main():
 
     logger.info(f"Found {len(activities_to_sync)} activities to sync")
 
-    # Only now authenticate with Garmin since we have activities to upload
+    # Ensure Garmin is authenticated before uploading
     if not garmin_client.authenticate():
         logger.error("Failed to authenticate with Garmin")
         return
@@ -604,7 +572,6 @@ def main():
             )
 
         # Save the latest synced activity date after each successful upload
-        # This means if the script stops halfway, we'll still have saved some progress
         if latest_synced_date and sync_count > 0:
             save_last_sync_date(latest_synced_date)
 
