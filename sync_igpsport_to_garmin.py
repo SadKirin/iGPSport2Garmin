@@ -13,6 +13,7 @@ import random
 import datetime
 import requests
 import tempfile
+import shutil
 from pathlib import Path
 import logging
 from dateutil.parser import parse
@@ -29,7 +30,7 @@ logger = logging.getLogger("igpsport-to-garmin")
 # Constants
 LAST_SYNC_FILE = "last_sync_date.json"
 OVERLAP_BUFFER_MINUTES = 5  # Consider activities overlapping if within 5 minutes
-GARMIN_TOKEN_FILE = "garmin_token.json"  # File to store Garmin token (not a directory)
+GARMIN_TOKEN_STORE_DIR = "garmin_token_store"  # Directory to store Garmin tokens
 
 
 class IGPSportClient:
@@ -190,19 +191,21 @@ class GarminClient:
             True if authentication is successful, False otherwise
         """
         try:
-            # Use a file for token storage (library expects a file path)
-            token_store = None if force else GARMIN_TOKEN_FILE
+            # Determine if Chinese region
+            is_cn = (self.domain == "garmin.cn")
 
-            # Initialize the API (this performs login and token handling)
-            self.api = Garmin(self.email, self.password, token_store)
+            # Create API instance (no token store parameter here)
+            self.api = Garmin(self.email, self.password, is_cn=is_cn)
 
-            # Force a fresh login if we have no token store or force=True
-            # The library will automatically load/store tokens
-            # We need to explicitly call login() if we want to force a refresh
-            if force or not os.path.exists(GARMIN_TOKEN_FILE):
-                self.api.login()
+            # If forcing, remove existing token store directory
+            if force and os.path.exists(GARMIN_TOKEN_STORE_DIR):
+                shutil.rmtree(GARMIN_TOKEN_STORE_DIR)
 
-            # Verify authentication by fetching user profile (simple API call)
+            # Login with optional token store directory
+            store_dir = None if force else GARMIN_TOKEN_STORE_DIR
+            self.api.login(store_dir)
+
+            # Verify authentication by fetching user profile
             self.api.get_full_name()
 
             logger.info("Successfully authenticated with Garmin Connect")
@@ -214,10 +217,10 @@ class GarminClient:
             self.authenticated = False
             self.api = None
 
-            # If token file exists and we weren't forcing, remove it and retry once
-            if not force and os.path.exists(GARMIN_TOKEN_FILE):
-                logger.info("Token file may be corrupted, removing and retrying...")
-                os.remove(GARMIN_TOKEN_FILE)
+            # If token store exists and we're not forcing, remove it and retry once
+            if not force and os.path.exists(GARMIN_TOKEN_STORE_DIR):
+                logger.info("Token store may be corrupted, removing and retrying...")
+                shutil.rmtree(GARMIN_TOKEN_STORE_DIR)
                 return self.authenticate(force=True)
             return False
 
@@ -492,11 +495,11 @@ def main():
     garmin_password = os.environ.get("GARMIN_PASSWORD")
     garmin_domain = os.environ.get("GARMIN_DOMAIN") or "garmin.cn"
 
-    logger.info(f"Garmin token file: {os.path.abspath(GARMIN_TOKEN_FILE)}")
-    if os.path.exists(GARMIN_TOKEN_FILE):
-        logger.info("Garmin token file exists")
+    logger.info(f"Garmin token store directory: {os.path.abspath(GARMIN_TOKEN_STORE_DIR)}")
+    if os.path.exists(GARMIN_TOKEN_STORE_DIR):
+        logger.info("Garmin token store directory exists")
     else:
-        logger.info("Garmin token file does not exist yet")
+        logger.info("Garmin token store directory does not exist yet")
 
     if not all(
         [
