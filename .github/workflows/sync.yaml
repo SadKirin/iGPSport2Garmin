@@ -26,10 +26,10 @@ jobs:
           restore-keys: |
             ${{ runner.os }}-pip-
 
-      - name: Restore Garmin token cache
+      - name: Restore Garmin token store
         uses: actions/cache@v3
         with:
-          path: garmin_token.json
+          path: garmin_token_store
           key: ${{ runner.os }}-garmin-token-${{ github.run_id }}
           restore-keys: |
             ${{ runner.os }}-garmin-token-
@@ -53,14 +53,11 @@ jobs:
         run: |
           git config --local user.email "action@github.com"
           git config --local user.name "GitHub Action"
-          # 检查 last_sync_date.json 和 garmin_token.json 是否有变化并提交
+          # 只提交同步日期文件，不提交 token 目录（token 通过 actions/cache 保存）
           if [ -f last_sync_date.json ]; then
             git add last_sync_date.json
+            git diff --quiet && git diff --staged --quiet || git commit -m "Update last sync date [skip ci]"
           fi
-          if [ -f garmin_token.json ]; then
-            git add garmin_token.json
-          fi
-          git diff --quiet && git diff --staged --quiet || git commit -m "Update sync data [skip ci]"
           
       - name: Push changes
         uses: ad-m/github-push-action@master
