@@ -13,12 +13,13 @@ import random
 import datetime
 import requests
 import tempfile
+import shutil
 from pathlib import Path
 import logging
 from dateutil.parser import parse
 from typing import Dict, List, Optional, Tuple, Any
 
-from garminconnect import GarminConnect
+from garminconnect import Garmin
 
 # Configure logging
 logging.basicConfig(
@@ -29,7 +30,7 @@ logger = logging.getLogger("igpsport-to-garmin")
 # Constants
 LAST_SYNC_FILE = "last_sync_date.json"
 OVERLAP_BUFFER_MINUTES = 5  # Consider activities overlapping if within 5 minutes
-GARMIN_TOKEN_FILE = "garmin_token.json"  # File to store Garmin token
+GARMIN_TOKEN_STORE_DIR = "garmin_token_store"  # Directory to store Garmin token
 
 
 class IGPSportClient:
@@ -176,7 +177,7 @@ class GarminClient:
         self.domain = domain   # e.g., "garmin.cn" or "garmin.com"
         self.max_retries = max_retries
         self.retry_delay = retry_delay
-        self.client = None
+        self.api = None
         self.authenticated = False
 
     def authenticate(self, force: bool = False) -> bool:
@@ -190,19 +191,15 @@ class GarminClient:
             True if authentication is successful, False otherwise
         """
         try:
-            # Initialize client with token store (file)
-            # If force=True, we don't load any existing token
-            token_store = None if force else GARMIN_TOKEN_FILE
+            # Use directory for token storage (library expects a directory)
+            token_store = None if force else GARMIN_TOKEN_STORE_DIR
 
-            self.client = GarminConnect(
-                email=self.email,
-                password=self.password,
-                domain=self.domain,
-                token_store=token_store,
-            )
+            # Initialize the API (this performs login)
+            self.api = Garmin(self.email, self.password, token_store)
 
-            # login() will try to use stored token; if invalid or force=True, it will re-login
-            self.client.login()
+            # Verify authentication by fetching user profile (simple API call)
+            self.api.get_full_name()
+
             logger.info("Successfully authenticated with Garmin Connect")
             self.authenticated = True
             return True
@@ -210,12 +207,12 @@ class GarminClient:
         except Exception as e:
             logger.error(f"Error authenticating with Garmin Connect: {e}")
             self.authenticated = False
-            self.client = None
+            self.api = None
 
-            # If token file exists and we weren't forcing, try removing it and retry once
-            if not force and os.path.exists(GARMIN_TOKEN_FILE):
-                logger.info("Token file may be corrupted, removing and retrying...")
-                os.remove(GARMIN_TOKEN_FILE)
+            # If token store exists and we weren't forcing, remove it and retry once
+            if not force and os.path.exists(GARMIN_TOKEN_STORE_DIR):
+                logger.info("Token store may be corrupted, removing and retrying...")
+                shutil.rmtree(GARMIN_TOKEN_STORE_DIR)
                 return self.authenticate(force=True)
             return False
 
@@ -227,7 +224,7 @@ class GarminClient:
 
         try:
             # get_activities(start, limit) returns list, newest first
-            activities = self.client.get_activities(0, limit)
+            activities = self.api.get_activities(0, limit)
             return activities if isinstance(activities, list) else []
         except Exception as e:
             logger.error(f"Error getting activities from Garmin Connect: {e}")
@@ -271,12 +268,12 @@ class GarminClient:
                     tmp_path = tmp_file.name
 
                 # Upload the activity
-                response = self.client.upload_activity(tmp_path)
+                response = self.api.upload_activity(tmp_path)
 
                 # Optionally set activity name
                 if activity_name and response and "activityId" in response:
                     try:
-                        self.client.update_activity(response["activityId"], {"name": activity_name})
+                        self.api.update_activity(response["activityId"], {"name": activity_name})
                         logger.info(f"Renamed activity to '{activity_name}'")
                     except Exception as e:
                         logger.warning(f"Failed to rename activity: {e}")
@@ -490,11 +487,11 @@ def main():
     garmin_password = os.environ.get("GARMIN_PASSWORD")
     garmin_domain = os.environ.get("GARMIN_DOMAIN") or "garmin.cn"
 
-    logger.info(f"Garmin token file location: {os.path.abspath(GARMIN_TOKEN_FILE)}")
-    if os.path.exists(GARMIN_TOKEN_FILE):
-        logger.info("Garmin token file exists")
+    logger.info(f"Garmin token store directory: {os.path.abspath(GARMIN_TOKEN_STORE_DIR)}")
+    if os.path.exists(GARMIN_TOKEN_STORE_DIR):
+        logger.info("Garmin token store directory exists")
     else:
-        logger.info("Garmin token file does not exist yet")
+        logger.info("Garmin token store directory does not exist yet")
 
     if not all(
         [
