@@ -37,8 +37,7 @@ jobs:
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
-          pip uninstall -y garminconnect curl_cffi
-          pip install garminconnect==0.3.2 requests python-dateutil
+          pip install -r requirements.txt
           
       - name: Run sync script
         env:
