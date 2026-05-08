@@ -53,8 +53,11 @@ jobs:
         run: |
           git config --local user.email "action@github.com"
           git config --local user.name "GitHub Action"
-          git add last_sync_date.json
-          git diff --quiet && git diff --staged --quiet || git commit -m "Update last sync date [skip ci]"
+          # 关键修复：判断文件存在才add，不存在则跳过
+          if [ -f last_sync_date.json ]; then
+            git add last_sync_date.json
+            git diff --quiet && git diff --staged --quiet || git commit -m "Update last sync date [skip ci]"
+          fi
           
       - name: Push changes
         uses: ad-m/github-push-action@master
