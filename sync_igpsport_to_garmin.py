@@ -129,16 +129,15 @@ class GarminClient:
     def authenticate(self, force: bool = False) -> bool:
         try:
             is_cn = (self.domain == 'cn')
-            logger.info(f"Logging in to Garmin {'CN' if is_cn else 'global'} region (web service mode)...")
-            # use_webservice=True 强制使用网页端API，避免移动端域名的SSL问题
+            logger.info(f"Logging in to Garmin {'CN' if is_cn else 'global'} region...")
+            # v0.3.4 版本不再需要 use_webservice 参数
             self.client = Garmin(
                 email=self.email,
                 password=self.password,
-                is_cn=is_cn,
-                use_webservice=True   # 关键参数，对于3.2+有效
+                is_cn=is_cn
             )
             self.client.login()
-            self.client.get_full_name()  # 验证
+            self.client.get_full_name()  # 验证登录
             logger.info("Successfully authenticated with Garmin Connect")
             self.authenticated = True
             return True
